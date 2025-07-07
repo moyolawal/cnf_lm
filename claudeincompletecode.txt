@@ -1,0 +1,803 @@
+import requests
+import json
+from typing import List, Dict, Optional, Union
+import logging
+import re
+from dotenv import load_dotenv
+import os
+import sys
+import openai
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+import pickle
+from datetime import datetime
+import hashlib
+import ssl
+import urllib3
+from urllib3.exceptions import InsecureRequestWarning
+import warnings
+from bs4 import BeautifulSoup
+import html2text
+
+# Load environment variables
+load_dotenv()
+
+# SSL Bypass Configuration
+class SSLBypassConfig:
+    """Handle SSL certificate bypass configuration"""
+    
+    @staticmethod
+    def setup_ssl_bypass():
+        """Configure SSL bypass for the entire application"""
+        
+        # Disable SSL warnings
+        urllib3.disable_warnings(InsecureRequestWarning)
+        warnings.filterwarnings('ignore', message='Unverified HTTPS request')
+        warnings.filterwarnings('ignore', category=urllib3.exceptions.InsecureRequestWarning)
+        
+        # Global SSL bypass
+        ssl._create_default_https_context = ssl._create_unverified_context
+        
+        # Set environment variables
+        os.environ.update({
+            'PYTHONHTTPSVERIFY': '0',
+            'CURL_CA_BUNDLE': '',
+            'REQUESTS_CA_BUNDLE': '',
+            'SSL_VERIFY': 'False'
+        })
+        
+        # Monkey patch requests globally
+        original_request = requests.Session.request
+        
+        def patched_request(self, method, url, **kwargs):
+            kwargs.setdefault('verify', False)
+            return original_request(self, method, url, **kwargs)
+        
+        requests.Session.request = patched_request
+        
+        # Patch urllib3 for additional libraries
+        urllib3.util.ssl_.DEFAULT_CIPHERS = 'ALL:@SECLEVEL=1'
+        
+        logging.info("SSL bypass configured successfully")
+
+# Apply SSL bypass at module level
+SSLBypassConfig.setup_ssl_bypass()
+
+class ConfluenceLLMChatbot:
+    def __init__(self, base_url: str = None, token: str = None, username: str = None, password: str = None,
+                 llm_provider: str = "huggingface", embedding_model: str = "all-MiniLM-L6-v2"):
+        """
+        Initialize Confluence API client with LLM integration
+        
+        Args:
+            base_url: Your Confluence base URL
+            token: Personal access token (if provided, username/password are not required)
+            username: Your username
+            password: Your password or personal access token
+            llm_provider: LLM provider ("openai", "anthropic", "local", "huggingface")
+            embedding_model: Sentence transformer model for embeddings
+        """
+
+        # Apply SSL bypass for this instance
+        self._setup_ssl_bypass()
+
+        # Confluence setup
+        self.base_url = (base_url or os.getenv('CONFLUENCE_URL')).rstrip('/')
+        token = token or os.getenv('CONFLUENCE_TOKEN')
+        username = username or os.getenv('CONFLUENCE_USERNAME')
+        password = password or os.getenv('CONFLUENCE_PASSWORD')
+        
+        self.session = requests.Session()
+
+        if token:
+            self.session.headers.update({'Authorization': f'Bearer {token}'})
+        elif username and password:
+            self.session.auth = (username, password)
+        else:
+            raise ValueError("Missing required configuration. Please provide either token or username and password, or set environment variables.")
+
+        # Create session with SSL bypass       
+        self.session.verify = False  # Disable SSL verification
+        
+        # Set additional headers to handle SSL issues
+        self.session.headers.update({
+            'User-Agent': 'ConfluenceLLMChatbot/1.0',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        })
+
+        # Initialize HTML to text converter
+        self.html_converter = html2text.HTML2Text()
+        self.html_converter.ignore_links = False
+        self.html_converter.ignore_images = True
+        self.html_converter.ignore_emphasis = False
+        self.html_converter.body_width = 0  # Don't wrap lines
+
+        # LLM setup
+        self.llm_provider = llm_provider
+        self._setup_llm()
+        
+        # Embedding model for semantic search - with SSL bypass
+        try:
+            self.embedding_model = SentenceTransformer(embedding_model)
+            logging.info(f"Loaded embedding model: {embedding_model}")
+        except Exception as e:
+            logging.error(f"Failed to load embedding model: {e}")
+            # Fallback to a simpler approach if model loading fails
+            self.embedding_model = None
+        
+        # Knowledge base cache
+        self.knowledge_base = {}
+        self.embeddings_cache = {}
+        self.cache_file = "confluence_knowledge_cache.pkl"
+        self._load_knowledge_cache()
+        
+        # Test connection
+        self._test_connection()
+
+    def _setup_ssl_bypass(self):
+        """Setup SSL bypass for this instance"""
+        # Create unverified SSL context
+        self.ssl_context = ssl.create_default_context()
+        self.ssl_context.check_hostname = False
+        self.ssl_context.verify_mode = ssl.CERT_NONE
+        
+        # Disable SSL warnings for this instance
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        logging.info("SSL bypass configured for Confluence chatbot instance")
+
+    def _setup_llm(self):
+        """Setup LLM based on provider with SSL bypass"""
+        if self.llm_provider == "openai":
+            # OpenAI with SSL bypass
+            openai.api_key = os.getenv('OPENAI_API_KEY')
+            if not openai.api_key:
+                raise ValueError("OPENAI_API_KEY not found in environment variables")
+
+            # Patch OpenAI's requests if needed
+            try:
+                import openai.api_requestor
+                original_request = openai.api_requestor.requests.request
+                
+                def patched_openai_request(method, url, **kwargs):
+                    kwargs.setdefault('verify', False)
+                    return original_request(method, url, **kwargs)
+                
+                openai.api_requestor.requests.request = patched_openai_request
+            except Exception as e:
+                logging.warning(f"Could not patch OpenAI requests: {e}")
+
+        elif self.llm_provider == "anthropic":
+            # For Anthropic Claude with SSL bypass
+            try:
+                import anthropic
+                
+                # Create custom httpx client with SSL bypass
+                import httpx
+                
+                # Create custom client with SSL disabled
+                custom_client = httpx.Client(verify=False)
+                
+                self.anthropic_client = anthropic.Anthropic(
+                    api_key=os.getenv('ANTHROPIC_API_KEY'),
+                    http_client=custom_client
+                )
+            except Exception as e:
+                logging.error(f"Failed to setup Anthropic client: {e}")
+                
+        elif self.llm_provider == "huggingface":
+            # For Hugging Face transformers with SSL bypass
+            try:
+                from transformers import pipeline
+                from huggingface_hub import configure_http_backend
+                import requests
+                
+                # Set environment variables for HuggingFace
+                os.environ['HUGGINGFACE_HUB_TOKEN'] = os.getenv('HF_TOKEN','')
+                os.environ['HUGGINGFACE_HUB_ENDPOINT'] = os.getenv('HF_ENDPOINT','')
+                os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
+                os.environ['HF_HUB_DISABLE_SSL_VERIFICATION'] = '1'
+                os.environ['TRANSFORMERS_OFFLINE'] = '0'
+                os.environ['PYTHONHTTPSVERIFY'] = '0'             
+                os.environ['REQUESTS_CA_BUNDLE'] = ''
+                os.environ['CURL_CA_BUNDLE'] = ''
+
+                def backend_factory() -> requests.Session:
+                    session = requests.Session()
+                    session.verify = False
+                    return session
+                configure_http_backend(backend_factory=backend_factory)               
+               
+                # Download model with SSL bypass
+                model_name = os.getenv('HF_MODEL_NAME', 'microsoft/DialoGPT-medium')
+                
+                self.hf_pipeline = pipeline('text-generation', model=model_name)
+                
+            except Exception as e:
+                logging.error(f"Failed to setup HuggingFace pipeline: {e}")
+                self.hf_pipeline = None
+        elif self.llm_provider == "local":
+            # For local models (e.g., Ollama) with SSL bypass
+            self.local_api_url = os.getenv('LOCAL_LLM_URL', 'http://localhost:11434')
+            
+            # Create session for local API calls
+            self.local_session = requests.Session()
+            self.local_session.verify = False
+
+    def _test_connection(self):
+        """Test if we can connect to Confluence with SSL bypass"""
+        try:
+            response = self.session.get(
+                f"{self.base_url}/rest/api/space",
+                timeout=10,
+                verify=False  # Explicit SSL bypass
+            )
+            response.raise_for_status()
+            logging.info("Successfully connected to Confluence with SSL bypass")
+        except requests.exceptions.SSLError as e:
+            logging.error(f"SSL Error connecting to Confluence: {e}")
+            raise
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to connect to Confluence: {e}")
+            raise
+
+    def _load_knowledge_cache(self):
+        """Load cached knowledge base and embeddings"""
+        try:
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file, 'rb') as f:
+                    cache_data = pickle.load(f)
+                    self.knowledge_base = cache_data.get('knowledge_base', {})
+                    self.embeddings_cache = cache_data.get('embeddings_cache', {})
+                logging.info(f"Loaded {len(self.knowledge_base)} cached documents")
+        except Exception as e:
+            logging.error(f"Failed to load cache: {e}")
+
+    def _save_knowledge_cache(self):
+        """Save knowledge base and embeddings to cache"""
+        try:
+            cache_data = {
+                'knowledge_base': self.knowledge_base,
+                'embeddings_cache': self.embeddings_cache,
+                'last_updated': datetime.now().isoformat()
+            }
+            with open(self.cache_file, 'wb') as f:
+                pickle.dump(cache_data, f)
+            logging.info("Knowledge cache saved successfully")
+        except Exception as e:
+            logging.error(f"Failed to save cache: {e}")
+
+    def extract_text_from_confluence_html(self, html_content: str) -> str:
+        """
+        Enhanced text extraction from Confluence HTML content
+        
+        Args:
+            html_content: HTML content from Confluence
+            
+        Returns:
+            Clean, readable text
+        """
+        try:
+            if not html_content:
+                return ""
+            
+            # Use BeautifulSoup for better HTML parsing
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Remove script and style elements
+            for script in soup(["script", "style"]):
+                script.decompose()
+            
+            # Convert to markdown-like format using html2text
+            markdown_text = self.html_converter.handle(str(soup))
+            
+            # Clean up the text
+            # Remove excessive whitespace
+            text = re.sub(r'\n\s*\n', '\n\n', markdown_text)
+            text = re.sub(r' +', ' ', text)
+            text = text.strip()
+            
+            # Remove confluence-specific markup that might not be useful
+            text = re.sub(r'\[.*?\]', '', text)  # Remove bracketed content
+            text = re.sub(r'_{3,}', '', text)   # Remove long underscores
+            
+            return text
+            
+        except Exception as e:
+            logging.error(f"Failed to extract text from HTML: {e}")
+            # Fallback to simple text extraction
+            return re.sub(r'<[^>]+>', '', html_content)
+
+    def get_comprehensive_page_content(self, page_id: str) -> Dict:
+        """
+        Get comprehensive content of a page including all text, links, and metadata
+        
+        Args:
+            page_id: Confluence page ID
+            
+        Returns:
+            Dictionary with comprehensive page information
+        """
+        try:
+            # Get page with expanded content
+            params = {
+                'expand': 'body.storage,body.view,space,version,ancestors,children.page,metadata,restrictions'
+            }
+            
+            response = self.session.get(
+                f"{self.base_url}/rest/api/content/{page_id}",
+                params=params,
+                timeout=30,
+                verify=False
+            )
+            response.raise_for_status()
+            page_data = response.json()
+            
+            # Extract comprehensive content
+            storage_content = page_data.get('body', {}).get('storage', {}).get('value', '')
+            view_content = page_data.get('body', {}).get('view', {}).get('value', '')
+            
+            # Use storage content primarily, fall back to view content
+            html_content = storage_content or view_content
+            
+            # Extract clean text
+            clean_text = self.extract_text_from_confluence_html(html_content)
+            
+            # Get page metadata
+            title = page_data.get('title', '')
+            space_key = page_data.get('space', {}).get('key', '')
+            space_name = page_data.get('space', {}).get('name', '')
+            
+            # Get ancestors for context
+            ancestors = page_data.get('ancestors', [])
+            breadcrumb = ' > '.join([ancestor.get('title', '') for ancestor in ancestors])
+            if breadcrumb:
+                breadcrumb += f' > {title}'
+            else:
+                breadcrumb = title
+            
+            # Get children pages
+            children = page_data.get('children', {}).get('page', {}).get('results', [])
+            child_titles = [child.get('title', '') for child in children]
+            
+            return {
+                'id': page_id,
+                'title': title,
+                'space_key': space_key,
+                'space_name': space_name,
+                'content': clean_text,
+                'html_content': html_content,
+                'breadcrumb': breadcrumb,
+                'children': child_titles,
+                'url': f"{self.base_url}{page_data.get('_links', {}).get('webui', '')}",
+                'version': page_data.get('version', {}).get('number', 1),
+                'last_modified': page_data.get('version', {}).get('when', ''),
+                'word_count': len(clean_text.split()),
+                'char_count': len(clean_text)
+            }
+            
+        except Exception as e:
+            logging.error(f"Failed to get comprehensive page content for {page_id}: {e}")
+            return {}
+
+    def build_knowledge_base(self, space_keys: List[str] = None, max_pages: int = 100):
+        """
+        Build comprehensive knowledge base from Confluence content
+        
+        Args:
+            space_keys: List of space keys to index (None for all spaces)
+            max_pages: Maximum number of pages to process
+        """
+        print("🔄 Building comprehensive knowledge base from Confluence...")
+        
+        # Get all spaces if none specified
+        if not space_keys:
+            spaces = self.get_spaces()
+            space_keys = [space['key'] for space in spaces]
+        
+        total_processed = 0
+        
+        for space_key in space_keys:
+            if total_processed >= max_pages:
+                break
+                
+            print(f"Processing space: {space_key}")
+            
+            # Search for all pages in space
+            results = self.search_content("*", limit=50, space_keys=[space_key])
+            
+            for result in results:
+                if total_processed >= max_pages:
+                    break
+                    
+                page_id = result['id']
+                
+                # Skip if already processed and not modified
+                content_hash = self._get_content_hash(result)
+                if page_id in self.knowledge_base and self.knowledge_base[page_id].get('hash') == content_hash:
+                    continue
+                
+                # Get comprehensive page content
+                page_content = self.get_comprehensive_page_content(page_id)
+                if not page_content or not page_content.get('content'):
+                    continue
+                
+                # Store in knowledge base
+                page_content['hash'] = content_hash
+                page_content['last_updated'] = datetime.now().isoformat()
+                
+                self.knowledge_base[page_id] = page_content
+                
+                # Generate embeddings if model is available
+                if self.embedding_model and page_content['content'].strip():
+                    try:
+                        # Create comprehensive text for embedding
+                        embedding_text = f"{page_content['title']} {page_content['breadcrumb']} {page_content['content']}"
+                        embedding = self.embedding_model.encode(embedding_text)
+                        self.embeddings_cache[page_id] = embedding
+                    except Exception as e:
+                        logging.error(f"Failed to generate embedding for {page_id}: {e}")
+                
+                total_processed += 1
+                print(f"Processed: {page_content['title'][:50]}... ({page_content['word_count']} words)")
+        
+        print(f"✅ Knowledge base built with {len(self.knowledge_base)} documents")
+        self._save_knowledge_cache()
+
+    def _get_content_hash(self, content: Dict) -> str:
+        """Generate hash for content to detect changes"""
+        content_str = str(content.get('version', {}).get('number', 0))
+        return hashlib.md5(content_str.encode()).hexdigest()
+
+    def semantic_search(self, query: str, top_k: int = 5) -> List[Dict]:
+        """
+        Perform semantic search using embeddings
+        
+        Args:
+            query: Search query
+            top_k: Number of top results to return
+            
+        Returns:
+            List of relevant documents with similarity scores
+        """
+        if not self.embedding_model or not self.embeddings_cache:
+            return []
+        
+        try:
+            # Generate query embedding
+            query_embedding = self.embedding_model.encode(query)
+            
+            # Calculate similarities
+            similarities = []
+            for page_id, doc_embedding in self.embeddings_cache.items():
+                if page_id in self.knowledge_base:
+                    similarity = cosine_similarity([query_embedding], [doc_embedding])[0][0]
+                    similarities.append({
+                        'page_id': page_id,
+                        'similarity': similarity,
+                        'document': self.knowledge_base[page_id]
+                    })
+            
+            # Sort by similarity and return top_k
+            similarities.sort(key=lambda x: x['similarity'], reverse=True)
+            return similarities[:top_k]
+        
+        except Exception as e:
+            logging.error(f"Semantic search failed: {e}")
+            return []
+
+    def generate_comprehensive_response(self, query: str, context_docs: List[Dict], max_tokens: int = 1000) -> str:
+        """
+        Generate comprehensive response using LLM with rich Confluence context
+        
+        Args:
+            query: User query
+            context_docs: Relevant documents from semantic search
+            max_tokens: Maximum tokens in response
+            
+        Returns:
+            Comprehensive LLM generated response
+        """
+        # Prepare rich context from multiple documents
+        context_sections = []
+        
+        for i, doc in enumerate(context_docs[:3], 1):  # Use top 3 documents
+            doc_info = doc['document']
+            similarity = doc.get('similarity', 0)
+            
+            # Create a rich context section
+            context_section = f"""
+Document {i}: {doc_info['title']}
+Location: {doc_info['breadcrumb']}
+Space: {doc_info['space_name']} ({doc_info['space_key']})
+Relevance: {similarity:.2f}
+Content: {doc_info['content'][:1500]}...
+URL: {doc_info['url']}
+"""
+            context_sections.append(context_section)
+        
+        context_text = "\n".join(context_sections)
+        
+        # Create comprehensive prompt
+        prompt = f"""You are an expert assistant specializing in providing detailed, comprehensive answers based on Confluence documentation. Your goal is to give thorough, actionable responses that fully address the user's question.
+
+CONTEXT FROM CONFLUENCE DOCUMENTATION:
+{context_text}
+
+USER QUESTION: {query}
+
+INSTRUCTIONS:
+1. Provide a comprehensive answer that directly addresses the user's question
+2. Use specific information from the Confluence documents provided
+3. Include step-by-step instructions when applicable
+4. Mention relevant details, prerequisites, or considerations
+5. If multiple approaches exist, explain the options
+6. Be specific and actionable rather than vague
+7. If the context doesn't fully answer the question, clearly state what additional information might be needed
+8. Organize your response with clear sections if the answer is complex
+
+COMPREHENSIVE ANSWER:"""
+
+        try:
+            if self.llm_provider == "openai":
+                response = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful, comprehensive Confluence documentation assistant that provides detailed, actionable answers."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=0.3  # Lower temperature for more focused responses
+                )
+                return response.choices[0].message.content.strip()
+                
+            elif self.llm_provider == "anthropic":
+                response = self.anthropic_client.messages.create(
+                    model="claude-3-sonnet-20240229",
+                    max_tokens=max_tokens,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                return response.content[0].text.strip()
+                
+            elif self.llm_provider == "local":
+                # For local models like Ollama
+                payload = {
+                    "model": "llama2",
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0.3}
+                }
+                response = self.local_session.post(
+                    f"{self.local_api_url}/api/generate",
+                    json=payload,
+                    verify=False
+                )
+                if response.status_code == 200:
+                    return response.json().get('response', 'No response generated')
+                    
+            elif self.llm_provider == "huggingface":
+                if self.hf_pipeline:
+                    response = self.hf_pipeline(prompt, max_length=len(prompt.split()) + max_tokens,
+                                              do_sample=True, temperature=0.3)
+                    return response[0]['generated_text'][len(prompt):].strip()
+                else:
+                    return "HuggingFace pipeline not available"
+                    
+        except Exception as e:
+            logging.error(f"LLM generation failed: {e}")
+            return "I apologize, but I'm having trouble generating a response right now. Please try again."
+
+    def answer_question_comprehensively(self, question: str, space_key: Optional[str] = None) -> str:
+        """
+        Answer question with comprehensive content analysis
+        
+        Args:
+            question: User's question
+            space_key: Optional space to search in
+            
+        Returns:
+            Comprehensive answer with source references
+        """
+        print(f"🤔 Analyzing question: {question}")
+        
+        # First, try semantic search for most relevant content
+        relevant_docs = self.semantic_search(question, top_k=5)
+        
+        if not relevant_docs:
+            print("🔍 No semantic matches found, trying traditional search...")
+            # Fallback to traditional search
+            if space_key:
+                results = self.search_in_space(space_key, question, limit=5)
+            else:
+                results = self.search_content(question, limit=5)
+            
+            # Get comprehensive content for search results
+            relevant_docs = []
+            for result in results:
+                page_content = self.get_comprehensive_page_content(result['id'])
+                if page_content:
+                    relevant_docs.append({
+                        'document': page_content,
+                        'similarity': 0.6  # Default similarity for traditional search
+                    })
+        
+        if not relevant_docs:
+            return """I couldn't find any relevant information in Confluence for your question. 
+
+This might be because:
+1. The information doesn't exist in the indexed Confluence spaces
+2. The question uses different terminology than what's in the documentation
+3. The knowledge base needs to be updated
+
+You might want to:
+- Try rephrasing your question with different keywords
+- Check if the information exists in Confluence directly
+- Ask an administrator to update the knowledge base
+
+What specific topic or area are you looking for information about?"""
+        
+        print(f"📚 Found {len(relevant_docs)} relevant documents")
+        
+        # Generate comprehensive response
+        comprehensive_answer = self.generate_comprehensive_response(question, relevant_docs)
+        
+        # Add source references with more detail
+        response = comprehensive_answer + "\n\n" + "="*50 + "\n**📚 SOURCE REFERENCES:**\n"
+        
+        for i, doc in enumerate(relevant_docs[:3], 1):
+            doc_info = doc['document']
+            similarity = doc.get('similarity', 0)
+            
+            response += f"\n**{i}. {doc_info['title']}**\n"
+            response += f"   📍 Location: {doc_info['breadcrumb']}\n"
+            response += f"   🏢 Space: {doc_info['space_name']} ({doc_info['space_key']})\n"
+            response += f"   📊 Relevance: {similarity:.2f}\n"
+            response += f"   📝 Content: {doc_info['word_count']} words\n"
+            response += f"   🔗 Link: {doc_info['url']}\n"
+        
+        return response
+
+    # Original methods with SSL bypass (keeping existing functionality)
+    def search_content(self, query: str, limit: int = 10, space_keys: List[str] = None) -> List[Dict]:
+        """Search for content using CQL (Confluence Query Language) with SSL bypass"""
+        cql_parts = [f'text ~ "{query}"']
+        
+        if space_keys:
+            space_filter = ' OR '.join([f'space = "{key}"' for key in space_keys])
+            cql_parts.append(f'({space_filter})')
+        
+        cql = ' AND '.join(cql_parts)
+        
+        params = {
+            'cql': cql,
+            'limit': limit,
+            'expand': 'body.storage,space,version,ancestors'
+        }
+        
+        try:
+            response = self.session.get(
+                f"{self.base_url}/rest/api/content/search",
+                params=params,
+                timeout=30,
+                verify=False
+            )
+            response.raise_for_status()
+            return response.json().get('results', [])
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Search failed: {e}")
+            return []
+
+    def get_page_content(self, page_id: str) -> Optional[Dict]:
+        """Get full content of a specific page with SSL bypass"""
+        params = {
+            'expand': 'body.storage,space,version,ancestors,children.page'
+        }
+        
+        try:
+            response = self.session.get(
+                f"{self.base_url}/rest/api/content/{page_id}",
+                params=params,
+                timeout=15,
+                verify=False
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to get page content: {e}")
+            return None
+
+    def search_in_space(self, space_key: str, query: str, limit: int = 10) -> List[Dict]:
+        """Search within a specific space with SSL bypass"""
+        return self.search_content(query, limit, [space_key])
+
+    def get_spaces(self) -> List[Dict]:
+        """Get list of all accessible spaces with SSL bypass"""
+        try:
+            response = self.session.get(
+                f"{self.base_url}/rest/api/space",
+                timeout=15,
+                verify=False
+            )
+            response.raise_for_status()
+            return response.json().get('results', [])
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to get spaces: {e}")
+            return []
+
+    def extract_text_from_content(self, content: Dict) -> str:
+        """Extract plain text from Confluence storage format - kept for backward compatibility"""
+        try:
+            body = content.get('body', {}).get('storage', {}).get('value', '')
+            return self.extract_text_from_confluence_html(body)
+        except Exception as e:
+            logging.error(f"Failed to extract text: {e}")
+            return ""
+
+  def interactive_chat_with_llm(self):
+        """Start an interactive chat session with enhanced LLM capabilities"""
+        print("🤖 Enhanced Confluence Chatbot with Comprehensive Content Analysis")
+        print("Ask me anything about your Confluence content!")
+        print("Commands:")
+        print("  - 'build' - Build/update knowledge base")
+        print("  - 'spaces' - List spaces")
+        print("  - 'quit' - Exit")
+        print("  - 'search in SPACE_KEY: query' - Search in specific space")
+        print("  - 'stats' - Show knowledge base statistics")
+        print()
+        
+        while True:
+            try:
+                user_input = input("You: ").strip()
+                
+                if user_input.lower() in ['quit', 'exit', 'bye']:
+                    print("👋 Goodbye!")
+                    break
+                    
+                elif user_input.lower() == 'build':
+                    print("Building comprehensive knowledge base...")
+                    self.build_knowledge_base(max_pages=50)
+                    print("Knowledge base updated!")
+                    
+                elif user_input.lower() == 'spaces':
+                    spaces = self.get_spaces()
+                    print("\n📁 Available Spaces:")
+                    for space in spaces:
+                        print(f"  - {space.get('name')} ({space.get('key')})")
+                    print()
+                    
+                elif user_input.lower() == 'stats':
+                    print(f"\n📊 Knowledge Base Statistics:")
+                    print(f"  - Total documents: {len(self.knowledge_base)}")
+                    print(f"  - Total embeddings: {len(self.embeddings_cache)}")
+                    if self.knowledge_base:
+                        total_words = sum(doc.get('word_count', 0) for doc in self.knowledge_base.values())
+                        avg_words = total_words / len(self.knowledge_base)
+                        print(f"  - Total words: {total_words}")
+                        print(f"  - Average words per document: {avg_words:.2f}")
+                    print()
+
+                elif user_input.lower().startswith('search in '):
+                    parts = user_input[10:].split(':', 1)
+                    if len(parts) == 2:
+                        space_key = parts[0].strip()
+                        query = parts[1].strip()
+                        response = self.answer_question_comprehensively(query, space_key)
+                        print(f"\nBot: {response}\n")
+                    else:
+                        print("⚠️ Format: search in SPACE_KEY: your query")
+                        
+                elif user_input:
+                    response = self.answer_question_comprehensively(user_input)
+                    print(f"\nBot: {response}\n")
+                else:
+                    print("Please enter a question or command.")
+
+            except KeyboardInterrupt:
+                print("\n👋 Goodbye!")
+                break
+            except Exception as e:
+                print(f"❌ Error: {e}")
